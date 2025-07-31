@@ -1,0 +1,16 @@
+grupo_1,grupo_2,grupo_3,book_name
+Caixa,Títulos de Renda Fixa (PF),,Caixa >> Títulos de Renda Fixa (PF)
+Risco,Multimercado Terceiros,,Risco >> Multimercado Terceiros
+Risco,Renda Variável Próprio,,Risco >> Renda Variável Próprio
+Risco,Crédito,,Risco >> Crédito
+Risco,Caixas e Provisionamentos,CPR (Provisões),Risco >> Caixas e Provisionamentos >> CPR (Provisões)
+Risco,Outros,,Risco >> Outros
+Risco,Renda Fixa,,Risco >> Renda Fixa
+Risco,Multimercado Próprio,,Risco >> Multimercado Próprio
+Risco,Renda Variável Terceiros,,Risco >> Renda Variável Terceiros
+Risco,Ilíquidos,,Risco >> Ilíquidos
+Risco,HYPE,,Risco >> HYPE
+Caixa,NC Cash Perenne,,Caixa >> NC Cash Perenne
+Risco,Caixas e Provisionamentos,,Risco >> Caixas e Provisionamentos
+Caixa,,,Caixa
+Risco,,,Risco
