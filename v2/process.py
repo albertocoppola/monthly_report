@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import csv
 import re
 import threading
 import traceback
@@ -42,6 +43,220 @@ import win32com.client
 from win32com.client import gencache
 import pythoncom
 from PyPDF2 import PdfReader
+
+# --- DIFF HELPERS (comparativo por run) ---
+import uuid, hashlib, json
+from datetime import timezone
+
+DIFF_LOG_CSV = Path("data/change_events.csv")
+
+def _canonicalize_for_diff(df, keys, numeric_precision=8):
+    if df is None or df.empty:
+        return pd.DataFrame(columns=keys)
+    df = df.copy()
+    # normaliza datas
+    for k in keys:
+        if "date" in k and k in df.columns:
+            df[k] = pd.to_datetime(df[k], errors="coerce").dt.normalize()
+    # arredonda numéricos (exceto as chaves)
+    num_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c not in keys]
+    if num_cols:
+        df[num_cols] = df[num_cols].round(numeric_precision)
+    # agrega duplicatas por chave (soma numéricos, first() pros demais)
+    agg = {c: ('sum' if c in num_cols else 'first') for c in df.columns if c not in keys}
+    if agg:
+        df = df.groupby(keys, as_index=False).agg(agg)
+    else:
+        df = df.drop_duplicates(subset=keys, keep="last")
+    # ordena colunas: chaves primeiro
+    others = [c for c in df.columns if c not in keys]
+    return df[keys + others]
+
+def _row_hash_series(df, cols):
+    def _val(v):
+        if pd.isna(v): return ''
+        return str(v)
+    if not cols:
+        return pd.Series([""]*len(df), index=df.index)
+    return (df[cols].astype(object)
+             .applymap(_val)
+             .agg('|'.join, axis=1)
+             .apply(lambda s: hashlib.sha256(s.encode('utf-8')).hexdigest()))
+
+def _changed_cols(row, tracked):
+    out=[]
+    for c in tracked:
+        a = row.get(f"{c}_new", np.nan)
+        b = row.get(f"{c}_cur", np.nan)
+        # NaN == NaN
+        if (pd.isna(a) and pd.isna(b)) or (a == b):
+            continue
+        out.append(c)
+    return out
+
+def _append_change_events(events_df):
+    # colunas base SEMPRE no CSV (inclui book_name para suportar 'costs')
+    cols_base = [
+        "entity","change_type","run_id","run_ts",
+        "overview_date","portfolio_id","instrument_name","book_name",
+        "old_hash","new_hash","changed_cols"
+    ]
+
+    DIFF_LOG_CSV.parent.mkdir(parents=True, exist_ok=True)
+    header_needed = not DIFF_LOG_CSV.exists()
+
+    # Se vier vazio, não cria arquivo com header incompleto.
+    if events_df is None or events_df.empty:
+        return
+
+    # Garante todas as bases e mantém dinâmicas (_old/_new/_net)
+    for c in cols_base:
+        if c not in events_df.columns:
+            events_df[c] = np.nan
+
+    dyn_cols = [c for c in events_df.columns if c not in cols_base]
+    cols_out = cols_base + dyn_cols
+    events_df = events_df[cols_out].copy()
+    events_df["changed_cols"] = events_df["changed_cols"].astype(str)
+
+    events_df.to_csv(
+        DIFF_LOG_CSV,
+        mode="a",
+        header=header_needed,
+        index=False,
+        quoting=csv.QUOTE_ALL,
+        lineterminator="\n",
+        encoding="utf-8"
+    )
+
+
+
+def diff_and_log(entity, old_df, new_df, *, keys, tracked_cols, logfn=print):
+    """Compara 'old_df' vs 'new_df' apenas nas keys/datas dadas e loga em CSV."""
+    if new_df is None or new_df.empty:
+        logfn(f"[{entity}] Nada novo para comparar.")
+        return
+
+    run_id = str(uuid.uuid4())
+    run_ts = pd.Timestamp.now(tz=timezone.utc)
+
+    # garante as colunas
+    for c in tracked_cols:
+        if c not in new_df.columns:
+            new_df[c] = np.nan
+    if old_df is None or old_df.empty:
+        old_df = pd.DataFrame(columns=keys + tracked_cols)
+
+    old_c = _canonicalize_for_diff(old_df, keys)
+    new_c = _canonicalize_for_diff(new_df, keys)
+
+    # alinhar colunas
+    all_cols = sorted(set(old_c.columns).union(new_c.columns))
+    old_c = old_c.reindex(columns=all_cols)
+    new_c = new_c.reindex(columns=all_cols)
+
+    # hashes
+    new_c['row_hash_new'] = _row_hash_series(new_c, tracked_cols)
+    old_c['row_hash_cur'] = _row_hash_series(old_c, tracked_cols)
+
+    merged = new_c.merge(old_c, on=keys, how='outer', suffixes=('_new','_cur'), indicator=True)
+
+    inserts = merged[merged['_merge'] == 'left_only'].copy()
+    deletes = merged[merged['_merge'] == 'right_only'].copy()
+    updates = merged[(merged['_merge'] == 'both') & (merged['row_hash_new'] != merged['row_hash_cur'])].copy()
+
+    # monta events
+    def _row_json(r, suffix):
+        d = {c: r.get(f"{c}{suffix}", np.nan) for c in tracked_cols}
+        # serializa de forma segura
+        def _safe(v):
+            if isinstance(v, (np.floating,)):
+                return None if pd.isna(v) else float(v)
+            if isinstance(v, (np.integer,)):
+                return int(v)
+            if pd.isna(v): return None
+            return v
+        d = {k:_safe(v) for k,v in d.items()}
+        return json.dumps(d, ensure_ascii=False)
+
+    events = []
+
+    def _val_num(v):
+        try:
+            if pd.isna(v): return None
+            return float(v)
+        except Exception:
+            return None
+
+    def _changed_cols_vals(r, cols):
+        out=[]
+        for c in cols:
+            a = r.get(f"{c}_new", np.nan)
+            b = r.get(f"{c}_cur", np.nan)
+            if (pd.isna(a) and pd.isna(b)) or (a == b):
+                continue
+            out.append(c)
+        return out
+
+    # INSERTS
+    for _, r in inserts.iterrows():
+        rec = {
+            "entity": entity, "change_type": "INSERT",
+            "run_id": run_id, "run_ts": run_ts,
+            **{k: r[k] for k in keys},
+            "old_hash": None, "new_hash": r.get("row_hash_new"),
+            "changed_cols": ",".join(tracked_cols),
+        }
+        for c in tracked_cols:
+            new_v = _val_num(r.get(f"{c}_new"))
+            rec[f"{c}_old"] = None
+            rec[f"{c}_new"] = new_v
+            rec[f"{c}_net"] = new_v  # old=0
+        events.append(rec)
+
+    # UPDATES
+    for _, r in updates.iterrows():
+        changed = _changed_cols_vals(r, tracked_cols)
+        rec = {
+            "entity": entity, "change_type": "UPDATE",
+            "run_id": run_id, "run_ts": run_ts,
+            **{k: r[k] for k in keys},
+            "old_hash": r.get("row_hash_cur"), "new_hash": r.get("row_hash_new"),
+            "changed_cols": ",".join(changed),
+        }
+        for c in tracked_cols:
+            old_v = _val_num(r.get(f"{c}_cur"))
+            new_v = _val_num(r.get(f"{c}_new"))
+            net_v = (new_v or 0.0) - (old_v or 0.0)
+            rec[f"{c}_old"] = old_v
+            rec[f"{c}_new"] = new_v
+            rec[f"{c}_net"] = net_v
+        events.append(rec)
+
+    # DELETES (soft)
+    for _, r in deletes.iterrows():
+        rec = {
+            "entity": entity, "change_type": "DELETE_SOFT",
+            "run_id": run_id, "run_ts": run_ts,
+            **{k: r[k] for k in keys},
+            "old_hash": r.get("row_hash_cur"), "new_hash": None,
+            "changed_cols": "",
+        }
+        for c in tracked_cols:
+            old_v = _val_num(r.get(f"{c}_cur"))
+            rec[f"{c}_old"] = old_v
+            rec[f"{c}_new"] = None
+            rec[f"{c}_net"] = - (old_v or 0.0)
+        events.append(rec)
+
+    events_df = pd.DataFrame(events) if events else pd.DataFrame(columns=[
+        "entity","change_type","run_id","run_ts", *keys,
+        "old_hash","new_hash","changed_cols", *[f"{c}_{suf}" for c in tracked_cols for suf in ("old","new","net")]
+    ])
+    _append_change_events(events_df)
+
+    ins, upd, dele = len(inserts), len(updates), len(deletes)
+    logfn(f"[{entity}] Diff: +{ins} inserts, +{upd} updates, +{dele} deletes")
 
 
 # =========================
@@ -272,18 +487,38 @@ def fetch_data(url: str, params: dict, access_id: str, secret: str, user_name: s
     response_api.raise_for_status()
     return response_api.json()
 
+def prev_b3_business_day(ts: pd.Timestamp) -> pd.Timestamp:
+    """Retorna o dia útil B3 imediatamente anterior a `ts` (data normalizada)."""
+    ts = pd.Timestamp(ts).normalize()
+    B3 = mcal.get_calendar('B3')
+    # janela curta pra trás é suficiente e robusta (considera feriados B3)
+    vd = B3.valid_days(start_date=ts - pd.Timedelta(days=10), end_date=ts)
+    vd = pd.DatetimeIndex(vd).tz_localize(None)
+    prev = vd[vd < ts]
+    if len(prev):
+        return prev.max().normalize()
+    # fallback (quase nunca usado): dia útil "global"
+    return (ts - pd.offsets.BDay(1)).normalize()
+
 
 def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> None:
-    start_date = ts_start
+    # data escolhida pelo usuário (normalizada)
+    user_start = pd.Timestamp(ts_start).normalize()
+    # d-1 útil B3 para cálculo dos *_ontem*
+    backfill_start = prev_b3_business_day(user_start)
 
-    # d-2 B3
+    # a janela efetiva de consulta começa no backfill
+    start_date = backfill_start
+
+    # d-2 B3 (fim da janela), reaproveitando seu cálculo atual
     B3 = mcal.get_calendar('B3')
     B3_holidays = B3.holidays()
-    feriados = [h for h in B3_holidays.holidays if ts_start <= h <= pd.Timestamp.today().normalize()]
+    feriados = [h for h in B3_holidays.holidays if start_date <= h <= pd.Timestamp.today().normalize()]
     bday_brasil = pd.offsets.CustomBusinessDay(holidays=feriados)
     d2_ts = (pd.Timestamp.today().normalize() - 2 * bday_brasil)
     d2_date = d2_ts.strftime('%Y-%m-%d')
 
+    logfn(f"Data escolhida: {user_start.strftime('%Y-%m-%d')} | backfill B3: {backfill_start.strftime('%Y-%m-%d')}")
     logfn(f"Janela de processamento: {start_date.strftime('%Y-%m-%d')} até {d2_date}")
 
     # POSIÇÕES
@@ -558,15 +793,24 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
     # FEEDS EXTERNOS
     logfn("Lendo feeds externos (se existirem)...")
     try:
-        britechdf = pd.read_csv('feed_data/feed_britech.csv', encoding='latin', parse_dates=['overview_date']).dropna(how='all')
-        britechdf[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']] = \
-            britechdf[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']].astype(float)
+        # ---------- BRITECH ----------
+        britechdf = pd.read_csv('feed_data/feed_britech.csv', encoding='latin').dropna(how='all')
+
+        # normalizações
+        britechdf[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']]=britechdf[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']].astype(float)
         britechdf['overview_date'] = pd.to_datetime(britechdf['overview_date'])
 
-        betacurve = pd.read_csv(BETA_FEED_FN, encoding='latin', parse_dates=['overview_date']).dropna(how='all')
-        betacurve[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']] = \
-            betacurve[['asset_value','dtd_ativo_pct','dtd_ativo_fin','exposure_value']].astype(float)
-        betacurve['overview_date'] = pd.to_datetime(betacurve['overview_date'])
+
+        # ---------- BETA CURVA ----------
+        betacurve = pd.read_csv(BETA_FEED_FN, encoding='latin').dropna(how='all')
+        betacurve['overview_date'] = pd.to_datetime(betacurve['overview_date'], errors='coerce').dt.normalize()
+        for c in ['instrument_name','book_name']:
+            if c in betacurve.columns:
+                betacurve[c] = betacurve[c].astype(str).str.strip()
+        for c in ['asset_value','exposure_value','dtd_ativo_fin']:
+            if c in betacurve.columns:
+                betacurve[c] = pd.to_numeric(betacurve[c], errors='coerce').fillna(0.0)
+
     except Exception as e:
         britechdf = pd.DataFrame()
         betacurve = pd.DataFrame()
@@ -617,61 +861,34 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
                 df_cpr = pd.concat([df_cpr, cpr_britech], ignore_index=True).reset_index(drop=True)
 
             # POSIÇÕES
-            df_from_exploded = pd.DataFrame()
-            if not df_explodido.empty:
-                df_from_exploded = df_explodido[
-                    (df_explodido['book_name'].isin(list(filtered_britech.book_name.drop_duplicates()))) &
-                    (df_explodido['portfolio_id'] == ptf)
-                ].copy()
-
-                df_offshore = df_explodido[
-                    (df_explodido['book_name'].str.lower().str.startswith('off')) &
-                    (df_explodido['portfolio_id'] == ptf)
-                ].copy()
-                df_from_exploded = pd.concat([df_from_exploded, df_offshore], ignore_index=True)
+            df_from_exploded = df_explodido[(df_explodido['book_name'].isin(list(filtered_britech.book_name.drop_duplicates()))) & 
+                (df_explodido['portfolio_id']== ptf)].copy()
+                
+            # adicionando offshore a amostra
+            df_offshore = df_explodido[(df_explodido['book_name'].str.lower().str.startswith('off'))& 
+                            (df_explodido['portfolio_id']== ptf)]
+            
+            df_from_exploded = pd.concat([df_from_exploded,df_offshore],ignore_index=True).reset_index(drop=True)
 
             pos_britech = filtered_britech[filtered_britech['book_name'] != 'Risco >> Caixas e Provisionamentos'].copy()
-            if not pos_britech.empty:
-                pos_britech['overview_date']    = pd.to_datetime(pos_britech['overview_date'], errors='coerce').dt.normalize()
-                if not df_from_exploded.empty:
-                    df_from_explodido = df_from_exploded.copy()
-                    df_from_explodido['overview_date'] = pd.to_datetime(df_from_explodido['overview_date'], errors='coerce').dt.normalize()
 
-                    cutoff = pd.Timestamp('2025-06-30')
-                    keys_britech = pos_britech.loc[
-                        pos_britech['overview_date'] <= cutoff,
-                        ['overview_date','portfolio_id','instrument_name','book_name']
-                    ].drop_duplicates()
+            # normalização mínima (datas, numéricos e nome do instrumento sem espaços)
+            for _df in (df_from_exploded, pos_britech, filtered_beta):
+                if isinstance(_df, pd.DataFrame) and not _df.empty:
+                    _df['overview_date'] = pd.to_datetime(_df['overview_date'], errors='coerce').dt.normalize()
+                    if 'instrument_name' in _df.columns:
+                        _df['instrument_name'] = _df['instrument_name'].astype(str).str.strip()
+                    for c in ['asset_value','exposure_value','dtd_ativo_fin']:
+                        if c in _df.columns:
+                            _df[c] = pd.to_numeric(_df[c], errors='coerce').fillna(0.0)
 
-                    if not keys_britech.empty:
-                        df_from_explodido = df_from_explodido.merge(
-                            keys_britech.assign(_drop=1),
-                            on=['overview_date','portfolio_id','instrument_name','book_name'],
-                            how='left'
-                        )
-                        df_from_explodido = df_from_explodido[df_from_explodido['_drop'].isna()].drop(columns=['_drop'])
-                        df_from_exploded = df_from_explodido
 
-            df_positions_f = pd.concat([df_from_exploded, pos_britech, filtered_beta], ignore_index=True)
+            df_positions_f = df_from_exploded.sort_values(['portfolio_id','instrument_name','overview_date'])
 
             if not df_positions_f.empty:
                 for c in ['asset_value','exposure_value','dtd_ativo_fin']:
                     if c in df_positions_f.columns:
                         df_positions_f[c] = pd.to_numeric(df_positions_f[c], errors='coerce').fillna(0.0)
-
-                group_keys = ['overview_date','portfolio_id','instrument_name','book_name']
-                agg_dict = {'asset_value':'sum', 'exposure_value':'sum', 'dtd_ativo_fin':'sum'}
-                if 'instrument_id' in df_positions_f.columns:
-                    agg_dict['instrument_id'] = 'first'
-
-                df_positions_f['overview_date'] = pd.to_datetime(df_positions_f['overview_date'], errors='coerce').dt.normalize()
-
-                df_positions_f = (
-                    df_positions_f
-                    .groupby(group_keys, as_index=False)
-                    .agg(agg_dict)
-                    .sort_values(['portfolio_id','instrument_name','overview_date'])
-                )
 
                 df_positions_f['exposure_value_ontem'] = (
                     df_positions_f.groupby(['portfolio_id','instrument_name'])['exposure_value'].shift(1)
@@ -694,6 +911,11 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
                     ['portfolio_id','instrument_name','Year']
                 )['dtd_ativo_pct'].transform(lambda x: (1 + x).cumprod() - 1)
 
+            # conjunto final sem remover linha nenhuma
+            df_positions_f = pd.concat(
+                [df_positions_f, pos_britech, filtered_beta],
+                ignore_index=True
+            )
             df_concat = pd.concat([df_positions_f, df_cpr], ignore_index=True) \
                         if (not df_positions_f.empty or not df_cpr.empty) else df_positions_f
 
@@ -717,6 +939,14 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
     # PERSISTÊNCIA INCREMENTAL
     logfn("Atualizando CSVs incrementalmente...")
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>> NOVO: recorte para salvar APENAS da data escolhida em diante
+    #     (ignora o dia de backfill na persistência e no diff de positions)
+    df_all_to_save = pd.DataFrame()
+    if isinstance(df_all, pd.DataFrame) and not df_all.empty:
+        df_all["overview_date"] = pd.to_datetime(df_all["overview_date"], errors="coerce").dt.normalize()
+        df_all_to_save = df_all[df_all["overview_date"] >= user_start].copy()
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<
+
     # groups.csv
     groups_out = groups_df.fillna("")
     p_groups = Path(CSV_GROUPS_PATH)
@@ -732,14 +962,83 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
         groups_out.to_csv(CSV_GROUPS_PATH, index=False)
 
     # positions.csv
-    if isinstance(df_all, pd.DataFrame) and not df_all.empty:
-        df_all = df_all.copy()
-        df_all["overview_date"] = pd.to_datetime(df_all["overview_date"], errors="coerce").dt.normalize()
+    if isinstance(df_all_to_save, pd.DataFrame) and not df_all_to_save.empty:
+        df_all_to_save = df_all_to_save.copy()
+        df_all_to_save["overview_date"] = pd.to_datetime(df_all_to_save["overview_date"], errors="coerce").dt.normalize()
+
+        # --- DIFF POSITIONS (janela = [start_date .. d2_date], só dtd_ativo_fin, tolerância ±1, ignora feeds estáticos) ---
+        try:
+            prev_positions = read_csv_safe(CSV_POSITIONS_PATH)
+
+            # janela do usuário (não deixa vazar 31/07 se o usuário escolheu 01/08)
+            win_start = pd.to_datetime(start_date).normalize()
+            win_end   = pd.to_datetime(d2_date).normalize()  # já existe no seu código
+            THRESH = 1.0  # só contar UPDATE se |Δ dtd_ativo_fin| >= 1
+
+            # recorta df_all para a janela
+            dfw = df_all.copy()
+            dfw["overview_date"] = pd.to_datetime(dfw["overview_date"], errors="coerce").dt.normalize()
+            dfw = dfw[(dfw["overview_date"] >= win_start) & (dfw["overview_date"] <= win_end)]
+
+            # nada pra comparar?
+            if dfw.empty:
+                logfn("[positions] Diff: janela vazia (sem datas na faixa).")
+            else:
+                POS_KEYS = ["overview_date", "portfolio_id", "instrument_name"]
+
+                # novo agregado (somente dtd_ativo_fin) sem feeds estáticos
+                new_slice = (
+                    dfw.groupby(POS_KEYS, as_index=False)
+                       .agg({"dtd_ativo_fin": "sum"})
+                )
+
+                # antigo agregado (recortado pela janela e sem feeds estáticos)
+                old_slice = pd.DataFrame()
+                if not prev_positions.empty and "overview_date" in prev_positions.columns:
+                    prev = prev_positions.copy()
+                    prev["overview_date"] = pd.to_datetime(prev["overview_date"], errors="coerce").dt.normalize()
+                    prev = prev[(prev["overview_date"] >= win_start) & (prev["overview_date"] <= win_end)]
+                    if "dtd_ativo_fin" in prev.columns:
+                        old_slice = (
+                            prev.groupby(POS_KEYS, as_index=False)
+                                .agg({"dtd_ativo_fin": "sum"})
+                        )
+
+                # aplica tolerância: neutraliza updates com |Δ| < THRESH (só para o LOG)
+                both = new_slice.merge(old_slice, on=POS_KEYS, how="outer", suffixes=("_new","_old"))
+                mask_both = both["dtd_ativo_fin_new"].notna() & both["dtd_ativo_fin_old"].notna()
+                delta = (both["dtd_ativo_fin_new"].fillna(0) - both["dtd_ativo_fin_old"].fillna(0))
+                small = mask_both & (delta.abs() < THRESH)
+                both.loc[small, "dtd_ativo_fin_new"] = both.loc[small, "dtd_ativo_fin_old"]
+
+                # recria slices filtrados pro diff genérico
+                new_slice_f = (
+                    both[POS_KEYS + ["dtd_ativo_fin_new"]]
+                    .rename(columns={"dtd_ativo_fin_new": "dtd_ativo_fin"})
+                    .dropna(subset=["dtd_ativo_fin"])
+                    .groupby(POS_KEYS, as_index=False)["dtd_ativo_fin"].sum()
+                )
+                old_slice_f = (
+                    both[POS_KEYS + ["dtd_ativo_fin_old"]]
+                    .rename(columns={"dtd_ativo_fin_old": "dtd_ativo_fin"})
+                    .dropna(subset=["dtd_ativo_fin"])
+                    .groupby(POS_KEYS, as_index=False)["dtd_ativo_fin"].sum()
+                )
+                diff_and_log(
+                    "positions",
+                    old_slice_f, new_slice_f,
+                    keys=POS_KEYS,
+                    tracked_cols=["dtd_ativo_fin"],
+                    logfn=logfn
+                )
+        except Exception as _e:
+            logfn(f"[WARN] Diff positions falhou: {_e}")
+
         upsert_by_date(
             CSV_POSITIONS_PATH,
-            df_all,
+            df_all_to_save,
             date_col="overview_date",
-            unique_keys=["overview_date", "portfolio_id", "instrument_id", "instrument_name", "book_name"],
+            unique_keys=None,
             logfn=logfn,
         )
     else:
@@ -753,11 +1052,34 @@ def run_etl_with_start_date(ts_start: pd.Timestamp, logfn=lambda m: None) -> Non
         britech_local = locals().get('britechdf', pd.DataFrame())
         if not britech_local.empty and 'portfolio_id' in britech_local.columns:
             costs_out = costs_out[costs_out['portfolio_id'].isin(britech_local['portfolio_id'].unique())]
+        # --- DIFF COSTS (comparativo por run) ---
+        try:
+            prev_costs = read_csv_safe(CSV_COSTS_PATH)
+            new_dates_c = pd.to_datetime(costs_out["overview_date"], errors="coerce").dt.normalize().dropna().unique()
+            old_slice_c = pd.DataFrame()
+            if not prev_costs.empty and "overview_date" in prev_costs.columns:
+                prev_costs["overview_date"] = pd.to_datetime(prev_costs["overview_date"], errors="coerce").dt.normalize()
+                old_slice_c = prev_costs[prev_costs["overview_date"].isin(new_dates_c)].copy()
+
+            COST_KEYS = ["overview_date", "portfolio_id", "instrument_name", "book_name"]
+            # aqui os nomes são os do costs_out (antes de renomear): financial_value / dtd_custos_fin
+            COST_TRACKED = [c for c in ["financial_value","dtd_custos_fin"] if c in costs_out.columns]
+
+            new_slice_c = costs_out[costs_out["overview_date"].isin(new_dates_c)].copy()
+            diff_and_log(
+                "costs",
+                old_slice_c, new_slice_c,
+                keys=COST_KEYS,
+                tracked_cols=COST_TRACKED,
+                logfn=logfn
+            )
+        except Exception as _e:
+            logfn(f"[WARN] Diff costs falhou: {_e}")
         upsert_by_date(
             CSV_COSTS_PATH,
             costs_out,
             date_col="overview_date",
-            unique_keys=["overview_date", "portfolio_id", "instrument_name", "book_name"],
+            unique_keys=None,
             float_format="%.16f",
             logfn=logfn,
         )
@@ -1134,6 +1456,205 @@ class PricesPreview(tk.Frame):
         for idx, (_, k) in enumerate(data):
             tree.move(k, "", idx)
 
+class ChangeEventsPreview(tk.Frame):
+    """Mostra change_events em abas por entidade (positions/costs) com resumo."""
+    COLS_BASE = ("run_ts","change_type","overview_date","portfolio_id","instrument_name","changed_cols","delta_dtd_ativo_fin")
+
+    def __init__(self, master):
+        super().__init__(master)
+        self._dfs_by_tab: dict[str, pd.DataFrame] = {}
+        self._trees: dict[str, ttk.Treeview] = {}
+
+        bar = tk.Frame(self)
+        bar.pack(fill="x", padx=2, pady=(0,6))
+        self.lbl_summary = tk.Label(bar, text="No change events.")
+        self.lbl_summary.pack(side="left")
+
+        tk.Button(bar, text="Refresh", command=self.refresh_from_disk).pack(side="right", padx=4)
+        tk.Button(bar, text="Export CSV", command=self._export_csv).pack(side="right", padx=4)
+        tk.Button(bar, text="Copy selected", command=self._copy_selected).pack(side="right", padx=4)
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True)
+
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=22)
+
+    def clear(self):
+        for tab in self.nb.tabs():
+            self.nb.forget(tab)
+        self._dfs_by_tab.clear()
+        self._trees.clear()
+        self.lbl_summary.config(text="No change events.")
+
+    def load(self, df: pd.DataFrame):
+        self.clear()
+        if df is None or df.empty:
+            self.lbl_summary.config(text="No change events.")
+            return
+
+        df = df.copy()
+        # normaliza tipos
+        for c in ("run_ts","overview_date"):
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+        # delta de dtd_ativo_fin (se existir em old/new json)
+        def _delta_dtd_ativo_fin(row):
+            try:
+                old = json.loads(row.get("old_row_json") or "{}")
+                new = json.loads(row.get("new_row_json") or "{}")
+                ov = float(old.get("dtd_ativo_fin") or 0.0)
+                nv = float(new.get("dtd_ativo_fin") or 0.0)
+                return round(nv - ov, 2)
+            except Exception:
+                return None
+        if "old_row_json" in df.columns and "new_row_json" in df.columns:
+            df["delta_dtd_ativo_fin"] = df.apply(_delta_dtd_ativo_fin, axis=1)
+        else:
+            df["delta_dtd_ativo_fin"] = None
+
+        # foca no último run
+        if "run_ts" in df.columns:
+            last_ts = df["run_ts"].max()
+            df = df[df["run_ts"] == last_ts].copy()
+
+        # resumo
+        total = len(df)
+        by_type = df["change_type"].value_counts().to_dict()
+        ts_txt = (df["run_ts"].iloc[0].strftime("%Y-%m-%d %H:%M:%S") if "run_ts" in df.columns and not df.empty else "-")
+        self.lbl_summary.config(text=f"{total} mudanças no último run ({ts_txt}) | " +
+                                    ", ".join(f"{k}:{v}" for k,v in by_type.items()))
+
+        # tabs por entidade
+        for entity, dfe in df.groupby("entity", sort=True):
+            frm = tk.Frame(self.nb)
+            self.nb.add(frm, text=entity)
+
+            cols = [c for c in self.COLS_BASE if c in (set(self.COLS_BASE)|set(dfe.columns))]
+            tree = ttk.Treeview(frm, columns=cols, show="headings")
+            vsb = ttk.Scrollbar(frm, orient="vertical", command=tree.yview)
+            hsb = ttk.Scrollbar(frm, orient="horizontal", command=tree.xview)
+            tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+
+            headers = {
+                "run_ts":"Run TS", "change_type":"Type", "overview_date":"Date",
+                "portfolio_id":"Portfolio", "instrument_name":"Instrument",
+                "changed_cols":"Changed Cols", "delta_dtd_ativo_fin":"Δ dtd_ativo_fin"
+            }
+            for c in cols:
+                tree.heading(c, text=headers.get(c, c), command=lambda col=c, t=tree: self._sort_by(t, col))
+                width = 140
+                if c in ("instrument_name","changed_cols"): width = 220
+                if c in ("delta_dtd_ativo_fin","portfolio_id"): width = 120
+                tree.column(c, width=width, anchor="center")
+
+            # duplo clique abre detalhe old/new
+            tree.bind("<Double-1>", lambda e, t=tree, d=dfe: self._open_details(t, d))
+
+            # ordena por change_type priorizando UPDATE
+            order_map = {"UPDATE":0, "INSERT":1, "DELETE_SOFT":2}
+            dfe["_ord"] = dfe["change_type"].map(order_map).fillna(9)
+            dfe = dfe.sort_values(["_ord","overview_date","instrument_name"], kind="mergesort")
+
+            for _, r in dfe.iterrows():
+                vals = []
+                for c in cols:
+                    v = r.get(c)
+                    if c == "run_ts" and pd.notna(v): v = v.strftime("%Y-%m-%d %H:%M:%S")
+                    if c == "overview_date" and pd.notna(v): v = pd.to_datetime(v).strftime("%Y-%m-%d")
+                    if c == "delta_dtd_ativo_fin" and v is not None: v = f"{v:,.2f}"
+                    vals.append("" if v is None else str(v))
+                tags = ("even",) if (len(tree.get_children("")) % 2 == 0) else ("odd",)
+                tree.insert("", "end", values=tuple(vals), tags=tags)
+
+            tree.tag_configure("even", background="#f7f7f7")
+            tree.tag_configure("odd",  background="#ffffff")
+
+            tree.grid(row=0, column=0, sticky="nsew")
+            vsb.grid(row=0, column=1, sticky="ns")
+            hsb.grid(row=1, column=0, sticky="ew")
+            frm.grid_rowconfigure(0, weight=1)
+            frm.grid_columnconfigure(0, weight=1)
+
+            self._trees[entity] = tree
+            self._dfs_by_tab[entity] = dfe.drop(columns=["_ord"], errors="ignore").reset_index(drop=True)
+
+    def refresh_from_disk(self):
+        try:
+            df = read_csv_safe(DIFF_LOG_CSV)
+            self.load(df)
+        except Exception as e:
+            messagebox.showwarning("Change Events", f"Erro ao ler {DIFF_LOG_CSV}:\n{e}")
+
+    def _current_tab(self):
+        tab_id = self.nb.select()
+        if not tab_id: return None, None, None
+        text = self.nb.tab(tab_id, "text")
+        return tab_id, text, self._trees.get(text)
+
+    def _copy_selected(self):
+        _, ent, tree = self._current_tab()
+        if not tree: return
+        rows = ["\t".join(tree.item(i, "values")) for i in tree.selection()]
+        if rows:
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(rows))
+
+    def _export_csv(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")], initialfile="change_events_last_run.csv")
+        if not path: return
+        _, ent, _ = self._current_tab()
+        if ent and self._dfs_by_tab.get(ent) is not None:
+            export_all = messagebox.askyesno("Export CSV", "Export ALL entities? (No = only current tab)")
+            df = pd.concat(self._dfs_by_tab.values(), ignore_index=True) if export_all else self._dfs_by_tab[ent]
+        else:
+            df = pd.concat(self._dfs_by_tab.values(), ignore_index=True) if self._dfs_by_tab else pd.DataFrame()
+        df.to_csv(path, index=False)
+        messagebox.showinfo("Export CSV", f"Saved:\n{path}")
+
+    def _sort_by(self, tree: ttk.Treeview, col: str):
+        data = [(tree.set(k, col), k) for k in tree.get_children("")]
+        def _to_key(v):
+            for caster in (float, pd.to_datetime):
+                try: return caster(v)
+                except Exception: pass
+            return v
+        data.sort(key=lambda x: _to_key(x[0]))
+        heading = tree.heading(col, "text")
+        desc = heading.endswith(" ↓")
+        tree.heading(col, text=heading.split(" ")[0] + (" ↑" if desc else " ↓"))
+        if desc: data.reverse()
+        for idx, (_, k) in enumerate(data):
+            tree.move(k, "", idx)
+
+    def _open_details(self, tree: ttk.Treeview, df_tab: pd.DataFrame):
+        sel = tree.selection()
+        if not sel: return
+        vals = tree.item(sel[0], "values")
+        # acha a linha correspondente pelo timestamp e instrument/date
+        try:
+            cols = [c for c in self.COLS_BASE if c in df_tab.columns]
+            row_dict = dict(zip(cols, vals))
+            # pega jsons pelo índice selecionado (mais simples/robusto)
+            idx = tree.index(sel[0])
+            rec = df_tab.iloc[idx]
+            old_js = json.dumps(json.loads(rec.get("old_row_json") or "{}"), indent=2, ensure_ascii=False)
+            new_js = json.dumps(json.loads(rec.get("new_row_json") or "{}"), indent=2, ensure_ascii=False)
+        except Exception:
+            old_js, new_js = "{}", "{}"
+
+        win = tk.Toplevel(self)
+        win.title("Change details")
+        win.geometry("760x520")
+        pan = ttk.Panedwindow(win, orient="horizontal")
+        pan.pack(fill="both", expand=True, padx=8, pady=8)
+
+        txt_old = scrolledtext.ScrolledText(pan, wrap="word", font=("Consolas", 10))
+        txt_new = scrolledtext.ScrolledText(pan, wrap="word", font=("Consolas", 10))
+        txt_old.insert("1.0", old_js); txt_new.insert("1.0", new_js)
+        txt_old.configure(state="disabled"); txt_new.configure(state="disabled")
+        pan.add(txt_old, weight=1); pan.add(txt_new, weight=1)
+
 
 # =========================
 # GUI principal
@@ -1164,6 +1685,32 @@ def main():
     txt_log_etl = scrolledtext.ScrolledText(frm_etl, height=28)
     txt_log_etl.grid(row=2, column=0, columnspan=5, sticky="nsew", pady=(10,0))
 
+    sep = ttk.Separator(frm_etl, orient="horizontal")
+    sep.grid(row=3, column=0, columnspan=5, sticky="ew", pady=(6,6))
+
+    changes = ChangeEventsPreview(frm_etl)
+    changes.grid(row=4, column=0, columnspan=5, sticky="nsew")
+
+    def _refresh_changes_last_run():
+        try:
+            if not DIFF_LOG_CSV.exists():
+                changes.load(pd.DataFrame())
+                return
+            df = pd.read_csv(DIFF_LOG_CSV, engine="python", on_bad_lines="skip")
+            if df.empty:
+                changes.load(pd.DataFrame()); return
+            df["run_ts"] = pd.to_datetime(df["run_ts"], errors="coerce")
+            last_ts = df["run_ts"].max()
+            changes.load(df[df["run_ts"] == last_ts].copy())
+        except Exception as e:
+            _gui_log(txt_log_etl, f"[WARN] Não consegui carregar change_events: {e}")
+
+
+    frm_etl.grid_rowconfigure(2, weight=1)  # log
+    frm_etl.grid_rowconfigure(4, weight=1)  # change table
+    for c in range(5):
+        frm_etl.grid_columnconfigure(c, weight=1)
+
     def on_process_etl():
         try:
             d_user = ent_data_etl.get_date()
@@ -1186,6 +1733,7 @@ def main():
                             _gui_log(txt_log_etl, f"Aviso ao atualizar Beta: {e}")
 
                     run_etl_with_start_date(ts_start, logfn=lambda m: _gui_log(txt_log_etl, m))
+                    txt_log_etl.after(0, _refresh_changes_last_run)   # atualiza a tabela com o último run
                     messagebox.showinfo("ETL", "Processamento finalizado com sucesso.")
                 except Exception as e:
                     err = "".join(traceback.format_exception(type(e), e, e.__traceback__))

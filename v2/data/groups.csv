@@ -1,20 +1,26 @@
-grupo_1,grupo_2,grupo_3,book_name
-Caixa,Títulos de Renda Fixa (PF),,Caixa >> Títulos de Renda Fixa (PF)
-Risco,Multimercado Terceiros,,Risco >> Multimercado Terceiros
-Offshore,Risco,US Stocks,Offshore >> Risco >> US Stocks
-Risco,Renda Variável Próprio,,Risco >> Renda Variável Próprio
-Risco,Crédito,,Risco >> Crédito
-Risco,Outros,,Risco >> Outros
-Risco,Renda Fixa,,Risco >> Renda Fixa
-Risco,Multimercado Próprio,,Risco >> Multimercado Próprio
-Risco,Renda Variável Terceiros,,Risco >> Renda Variável Terceiros
-Risco,Ilíquidos,,Risco >> Ilíquidos
-Risco,HYPE,,Risco >> HYPE
-Caixa,NC Cash Perenne,,Caixa >> NC Cash Perenne
-Risco,Caixas e Provisionamentos,CPR (Provisões),Risco >> Caixas e Provisionamentos >> CPR (Provisões)
-Risco,Caixas e Provisionamentos,,Risco >> Caixas e Provisionamentos
-Offshore,Risco,Renda Variável Próprio,Offshore >> Risco >> Renda Variável Próprio
-Offshore,Risco,Renda Variável de Terceiros,Offshore >> Risco >> Renda Variável de Terceiros
-Offshore,Risco,Multimercado Próprio,Offshore >> Risco >> Multimercado Próprio
-Caixa,,,Caixa
-Risco,,,Risco
+grupo_1,grupo_2,grupo_3,book_name,grupo_4
+Risco,Britech,,Risco >> Britech,
+Risco,Caixas e Provisionamentos,Caixa Fundos,Risco >> Caixas e Provisionamentos >> Caixa Fundos >> Cash & Carry,Cash & Carry
+Risco,Caixas e Provisionamentos,Caixa Fundos,Risco >> Caixas e Provisionamentos >> Caixa Fundos >> Sobras de Caixa,Sobras de Caixa
+Risco,Renda Variável Próprio,Hedge de Bolsa BR,Risco >> Renda Variável Próprio >> Hedge de Bolsa BR,
+Patrimonial,,,Patrimonial,
+Padrão,,,Padrão,
+Caixa,Títulos de Renda Fixa (PF),,Caixa >> Títulos de Renda Fixa (PF),
+Risco,Multimercado Terceiros,,Risco >> Multimercado Terceiros,
+Offshore,Risco,US Stocks,Offshore >> Risco >> US Stocks,
+Risco,Renda Variável Próprio,,Risco >> Renda Variável Próprio,
+Risco,Crédito,,Risco >> Crédito,
+Risco,Outros,,Risco >> Outros,
+Risco,Renda Fixa,,Risco >> Renda Fixa,
+Risco,Multimercado Próprio,,Risco >> Multimercado Próprio,
+Risco,Renda Variável Terceiros,,Risco >> Renda Variável Terceiros,
+Risco,Ilíquidos,,Risco >> Ilíquidos,
+Risco,HYPE,,Risco >> HYPE,
+Caixa,NC Cash Perenne,,Caixa >> NC Cash Perenne,
+Risco,Caixas e Provisionamentos,CPR (Provisões),Risco >> Caixas e Provisionamentos >> CPR (Provisões),
+Risco,Caixas e Provisionamentos,,Risco >> Caixas e Provisionamentos,
+Offshore,Risco,Renda Variável Próprio,Offshore >> Risco >> Renda Variável Próprio,
+Offshore,Risco,Renda Variável de Terceiros,Offshore >> Risco >> Renda Variável de Terceiros,
+Offshore,Risco,Multimercado Próprio,Offshore >> Risco >> Multimercado Próprio,
+Caixa,,,Caixa,
+Risco,,,Risco,
